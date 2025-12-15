@@ -1,0 +1,20 @@
+{
+  "name": "nuxt-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare"
+  },
+  "dependencies": {
+    "mrz": "^5.0.0",
+    "nuxt": "^3.20.2",
+    "pdfjs-dist": "^4.8.69",
+    "tesseract.js": "^7.0.0",
+    "vue": "^3.5.25",
+    "vue-router": "^4.6.3"
+  }
+}
