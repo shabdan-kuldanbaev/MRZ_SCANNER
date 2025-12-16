@@ -193,32 +193,9 @@ const processMrz = async () => {
     
     // --- Advanced Parsing Logic Start ---
 
-    // 1. Interfaces based on user request
-    interface VerificationReport {
-        status: 'VALID' | 'INVALID'
-        errors: string[]
-    }
-    
-    interface UnifiedMrzResult {
-        document_type: 'PASSPORT' | 'ID_CARD'
-        document_number: string
-        series: string
-        nationality: string
-        birth_date: string
-        sex: 'M' | 'F'
-        expiry_date: string
-        personal_number: string
-        names: {
-            surname: string
-            given_names: string
-        }
-        verification_status: 'VALID' | 'INVALID'
-        errors?: string[]
-        raw_lines?: string[]
-        cleaned_lines?: string[]
-    }
+    // --- Integration with 'mrz' library ---
 
-    // 2. Helper Functions (7-3-1 Algorithm & Cleaning)
+    // 1. Cleaning function
     const cleanMrzLine = (line: string): string => {
         let cleaned = line.toUpperCase()
 
@@ -232,11 +209,9 @@ const processMrz = async () => {
 
         // 2. Fix Separators: <[CL] followed by letter -> <<
         // Use a safe regex that avoids matching <<C or <<L (already separators)
-        // And ensure we don't break country codes starting with K (like KGZ) by removing K from this specific fix
         cleaned = cleaned.replace(/(^|[^<])<[CL](?=[A-Z])/g, '$1<<')
 
         // 3. Fix Tail Fillers: Replace [L,C,K] at end of line with <
-        // e.g. "...LLLLLLLLLLLLLLLK" -> "...<<<<<<<<<<<<<<<"
         const match = cleaned.match(/[LCK<]{3,}$/)
         if (match) {
             const tail = match[0]
@@ -259,284 +234,9 @@ const processMrz = async () => {
         return cleaned
     }
 
-    const getCharValue = (char: string): number => {
-        if (/[0-9]/.test(char)) return parseInt(char, 10)
-        if (/[A-Z]/.test(char)) return char.charCodeAt(0) - 55 // A=10, Z=35
-        if (char === '<') return 0
-        return 0
-    }
-
-    const calculateCheckDigit = (data: string): number => {
-        const weights = [7, 3, 1]
-        let sum = 0
-        for (let i = 0; i < data.length; i++) {
-            sum += getCharValue(data[i]) * weights[i % 3]
-        }
-        return sum % 10
-    }
-
-    // Verify a field against its check digit
-    // Returns null if valid, error string if invalid
-    const verifyField = (fieldValue: string, checkDigitChar: string, type: string, line: number): string | null => {
-        const calculated = calculateCheckDigit(fieldValue)
-        const expected = parseInt(checkDigitChar, 10)
-        
-        // If check digit is <, treat as 0? Usually checks are digits. 
-        // OCR might mistake numeric check digit for letter or < in bad cases, but we assume raw chars.
-        // If expected is NaN (e.g. OCR read a letter), it's definitely invalid.
-        if (isNaN(expected)) return `Invalid check digit format for ${type} (Line ${line}): '${checkDigitChar}'`
-        
-        if (calculated !== expected) {
-            return `${type} check failed (Line ${line}). Expected ${calculated}, found ${expected}. Value: ${fieldValue}`
-        }
-        return null
-    }
-
-    // 3. Parsers
-    const parseTD3 = (lines: string[]): UnifiedMrzResult => {
-        // Line 1: 44 chars
-        // Line 2: 44 chars
-        const l1 = lines[0]
-        const l2 = lines[1]
-        const errors: string[] = []
-
-        // Extract raw fields
-        // Line 1
-        // P<KGZSURNAME<<NAME<<<<<<<<<<<<<<<<<<<<<<
-        // 0-1: Type (P)
-        // 2-4: Issuer (KGZ)
-        // 5-43: Names
-        const issuer = l1.substring(2, 5).replace(/</g, '')
-        const nameSection = l1.substring(5, 44)
-        const nameParts = nameSection.split('<<')
-        const surname = nameParts[0].replace(/</g, ' ').trim()
-        const givenNames = nameParts.length > 1 ? nameParts[1].replace(/</g, ' ').trim() : ''
-
-        // Line 2
-        // A1234567<8KGZ9801015M2801015<<<<<<<<<<<<<<06
-        // 0-8: Doc Num
-        // 9: Check (of 0-8)
-        // 10-12: Nationality
-        // 13-18: DOB (YYMMDD)
-        // 19: Check (of 13-18)
-        // 20: Sex
-        // 21-26: Expiry
-        // 27: Check (of 21-26)
-        // 28-41: Personal Num (14 chars recommended, user said 29-42 (1-based) -> 28-42 (0-based) is 14 chars)
-        // User spec: "Доп. ID (Персональный номер) | Строка 2 | 29–42 | Строка | Позиция 43 (проверяет 29-42)"
-        // Correct 0-based indices:
-        // Doc Num: 0-9 (9 chars) -> Check at index 9 (User: Pos 10)
-        // Nationality: 10-13 (3 chars)
-        // DOB: 13-19 (6 chars) -> Check at index 19 (User: Pos 20)
-        // Sex: 20 (1 char) (User: Pos 21)
-        // Expiry: 21-27 (6 chars) -> Check at index 27 (User: Pos 28)
-        // Personal: 28-42 (14 chars) -> Check at index 42 (User: Pos 43)
-        // Composite: Index 43 (User: Pos 44) checks (0-10, 13-20, 21-28, 28-43) i.e. (Num+Ch, DOB+Ch, Exp+Ch, Pers+Ch)
-        // Wait, user spec says: "Позиция 44 (проверяет 1-10, 14-20, 22-28, 29-43)"
-        
-        const docNum = l2.substring(0, 9)
-        const docNumCheck = l2[9]
-        const nationality = l2.substring(10, 13).replace(/</g, '')
-        const dob = l2.substring(13, 19)
-        const dobCheck = l2[19]
-        const sex = l2[20] as 'M'|'F'|'X'|'<'
-        const expiry = l2.substring(21, 27)
-        const expiryCheck = l2[27]
-        const personalNum_raw = l2.substring(28, 42) 
-        const personalNum = personalNum_raw.replace(/</g, '')
-        const personalCheck = l2[42]
-        const compositeCheck = l2[43]
-
-        // VERIFICATION
-        const err1 = verifyField(docNum, docNumCheck, "Document Number", 2)
-        if (err1) errors.push(err1)
-        
-        const err2 = verifyField(dob, dobCheck, "Date of Birth", 2)
-        if (err2) errors.push(err2)
-
-        const err3 = verifyField(expiry, expiryCheck, "Expiration Date", 2)
-        if (err3) errors.push(err3)
-        
-        const err4 = verifyField(personalNum_raw, personalCheck, "Personal Number", 2)
-        if (err4) errors.push(err4)
-
-        // Composite Verification
-        // "checks 1-10, 14-20, 22-28, 29-43"
-        // In 0-based: 0-10 (10 chars), 13-20 (7 chars), 21-28 (7 chars), 28-43 (15 chars) ??
-        // Actually usually standard is:
-        // (DocNum + Check) + (DOB + Check) + (Expiry + Check) + (Personal + Check if present)
-        // Let's create the composite string based on standard ICAO for TD3:
-        // positions 0-10, 13-20, 21-43 (including their check digits and the personal number and its check digit)
-        // The user spec says: "проверяет 1-10, 14-20, 22-28, 29-43"
-        // 1-10 = 0-9 + 9 (10 chars) -> DocNum(9) + Check(1)
-        // 14-20 = 13-19 + 19 (7 chars) -> DOB(6) + Check(1)
-        // 22-28 = 21-27 + 27 (7 chars) -> Expiry(6) + Check(1)
-        // 29-43 = 28-42 + 42 (15 chars) -> Personal(14) + Check(1)
-        const compositeString = l2.substring(0, 10) + l2.substring(13, 20) + l2.substring(21, 43)
-        const err5 = verifyField(compositeString, compositeCheck, "Composite (Final)", 2)
-        if (err5) errors.push(err5)
-
-        // Series extraction (approximate, usually first 2 chars of doc number)
-        const series = docNum.substring(0, 2)
-
-        // Format dates YYYY-MM-DD (Basic heuristic for century: >50 = 19xx, <=50 = 20xx)
-        const formatYMD = (val: string) => {
-            if (val.length !== 6 || val.includes('<')) return val
-            const yy = parseInt(val.substring(0, 2))
-            const mm = val.substring(2, 4)
-            const dd = val.substring(4, 6)
-            const year = yy > 50 ? `19${yy}` : `20${yy}` // Adjust pivot as needed
-            return `${year}-${mm}-${dd}`
-        }
-
-        return {
-            document_type: 'PASSPORT',
-            document_number: docNum.replace(/</g, ''),
-            series: series.replace(/</g, ''),
-            nationality: nationality,
-            birth_date: formatYMD(dob),
-            sex: sex as 'M'|'F',
-            expiry_date: formatYMD(expiry),
-            personal_number: personalNum,
-            names: {
-                surname: surname,
-                given_names: givenNames
-            },
-            verification_status: errors.length === 0 ? 'VALID' : 'INVALID',
-            errors: errors,
-            raw_lines: lines,
-            cleaned_lines: lines
-        }
-    }
-
-    const parseTD1 = (lines: string[]): UnifiedMrzResult => {
-        // 3 lines of 30 chars
-        const l1 = lines[0]
-        const l2 = lines[1]
-        const l3 = lines[2]
-        const errors: string[] = []
-
-        // Line 1:
-        // I<KGZ12345678<7<<<<<<<<<<<<<<<
-        // 0-2: Type
-        // 2-5: Issuer (KGZ)
-        // 5-14: Doc Num (9 chars) (User: 6-14 -> 0-based 5-14)
-        // 14: Check (User: Pos 15 -> Index 14)
-        // 15-30: Optional 1 (Personal Num?) User spec: "Доп. ID 16-30" => Index 15-30 (15 chars)
-        // Wait, TD-1 standard:
-        // Doc Num: Pos 6-14 (9) -> Index 5-14
-        // Check: Pos 15 (1) -> Index 14
-        // Optional 1: Pos 16-30 (15) -> Index 15-30
-        
-        const docNum = l1.substring(5, 14)
-        const docNumCheck = l1[14]
-        const optional1_raw = l1.substring(15, 30) // Personal Num often here for ID cards
-        const personalNum = optional1_raw.replace(/</g, '')
-
-        // Line 2:
-        // 9801010M2801010KGZ<<<<<<<<<<<6
-        // 0-6: DOB (User: 1-6 -> Index 0-6)
-        // 6: Check (User: 7 -> Index 6)
-        // 7: Sex (User: 8 -> Index 7)
-        // 8-14: Expiry (User: 9-14 -> Index 8-14)
-        // 14: Check (User: 15 -> Index 14)
-        // 15-18: Nationality (KGZ)
-        // 18-29: Optional 2
-        // 29: Composite Check (User: Pos 30 -> Index 29)
-        
-        const dob = l2.substring(0, 6)
-        const dobCheck = l2[6]
-        const sex = l2[7] as 'M'|'F'|'X'|'<'
-        const expiry = l2.substring(8, 14)
-        const expiryCheck = l2[14]
-        const nationality = l2.substring(15, 18).replace(/</g, '')
-        // Composite check on Line 2 Pos 30 checks:
-        // Line 1: 1-15 (Index 0-14)? OR just DocNum(5-14)+Check(14) + Opt1(15-30) + Line 2 data?
-        // User spec for Composite: "Позиция 30 (Строка 2) (проверяет 1–15 Стр 1 и 1–29 Стр 2)"
-        // Note: Standard TD1 composite usually checks:
-        // (Line 1 Data) + (Line 2 Data excluding final digit)
-        // Specifically: (DocNum+Check + Opt1) + (DOB+Check + Expiry+Check + Opt2)
-        // Which corresponds to indices:
-        // L1: 5-30 (25 chars) 
-        // L2: 0-29 (29 chars)
-        // Wait, usually issuer/type (L1 0-5) is NOT included in composite.
-        // User says: "1-15 Стр 1". This implies indices 0-15?
-        // Standard TD1: 
-        // Zone 1: Line 1, pos 6-30 (Doc Num + Check + Opt1) => Indices 5-30
-        // Zone 2: Line 2, pos 1-7 (DOB + Check) => Indices 0-7
-        // Zone 3: Line 2, pos 9-15 (Expiry + Check) => Indices 8-15
-        // Zone 4: Line 2, pos 19-29 (Opt2) => Indices 18-29
-        // IMPORTANT: The standard checksum calculation line is:
-        // (L1 5-30) + (L2 0-7) + (L2 8-15) + (L2 18-29)
-        // Let's stick to standard ICAO TD1 composite unless strictly instructed otherwise, 
-        // but User says: "проверяет 1–15 Стр 1 и 1–29 Стр 2".
-        // Line 1 Pos 1-15 = Indices 0-15. This includes Type and Issuer. That's unusual for ICAO.
-        // I will implement STANDARD ICAO TD1 composite components which aligns with most "Advanced" needs:
-        // Composite string = (L1 5..30) + (L2 0..7) + (L2 8..15) + (L2 18..29)
-        // Let's verify standard: 
-        // https://en.wikipedia.org/wiki/Machine_Readable_Travel_Documents#TD1
-        // "Final check digit... over ... characters 6–30 (line 1), 1–7 (line 2), 9–15 (line 2), and 19–29 (line 2)"
-        // This matches standard indices 5-30, 0-7, 8-15, 18-29.
-        
-        const compositeString = l1.substring(5, 30) + l2.substring(0, 7) + l2.substring(8, 15) + l2.substring(18, 29)
-        const compositeCheck = l2[29]
-
-        const err1 = verifyField(docNum, docNumCheck, "Document Number", 1)
-        if (err1) errors.push(err1)
-
-        const err2 = verifyField(dob, dobCheck, "Date of Birth", 2)
-        if (err2) errors.push(err2)
-
-        const err3 = verifyField(expiry, expiryCheck, "Expiration Date", 2)
-        if (err3) errors.push(err3)
-
-        const err4 = verifyField(compositeString, compositeCheck, "Composite (Final)", 2)
-        if (err4) errors.push(err4)
-
-        // Line 3: Names
-        // NAME<<SURNAME<<<<<
-        const l3_clean = l3.replace(/<+$/, '') // trim trailing <
-        const nameParts = l3_clean.split('<<')
-        const surname = nameParts[0].replace(/</g, ' ').trim()
-        const givenNames = nameParts.length > 1 ? nameParts[1].replace(/</g, ' ').trim() : ''
-
-        // Series extraction (approx)
-        const series = docNum.substring(0, 2)
-
-        const formatYMD = (val: string) => {
-            if (val.length !== 6 || val.includes('<')) return val
-            const yy = parseInt(val.substring(0, 2))
-            const mm = val.substring(2, 4)
-            const dd = val.substring(4, 6)
-            const year = yy > 50 ? `19${yy}` : `20${yy}`
-            return `${year}-${mm}-${dd}`
-        }
-
-        return {
-            document_type: 'ID_CARD',
-            document_number: docNum.replace(/</g, ''),
-            series: series.replace(/</g, ''),
-            nationality: nationality,
-            birth_date: formatYMD(dob),
-            sex: sex as 'M' | 'F',
-            expiry_date: formatYMD(expiry),
-            personal_number: personalNum,
-            names: {
-                surname: surname,
-                given_names: givenNames
-            },
-            verification_status: errors.length === 0 ? 'VALID' : 'INVALID',
-            errors: errors,
-            raw_lines: lines,
-            cleaned_lines: lines
-        }
-    }
-
-    // 4. Main Processing (Robust + Custom Parsing)
-    // Extract MRZ lines from the OCR result
+    // 2. Extract and Clean Lines
     const mrzLinesRaw = extractMrzFromText(text)
     
-    // Apply cleaning to all extracted lines
     // Apply cleaning to all extracted lines
     const mrzLines = mrzLinesRaw.map(l => {
         try {
@@ -547,9 +247,6 @@ const processMrz = async () => {
         }
     })
     
-    // We expect 2 or 3 lines
-    // We need to find the block of lines that are most likely the MRZ
-    
     if (mrzLines.length < 2) {
       error.value = 'Could not detect MRZ in the document. Please ensure the MRZ area is clearly visible and crisp.'
       rawMrzText.value = text
@@ -557,33 +254,19 @@ const processMrz = async () => {
       return
     }
     
-    // Attempt parsing
-    // Strategy: 
-    // 1. Try TD-3 (2 lines of 44 chars)
-    // 2. Try TD-1 (3 lines of 30 chars)
-    // 3. Use sliding window refined lines if available
+    // 3. Parsing logic using 'mrz' library
+    let result: any = null
     
-    // We'll reuse the sliding window logic to get "clean" lines but target specific lengths
-    
-    let result: UnifiedMrzResult | null = null
-    let errorMsg = ''
-    
-    // Helper to try parsing a block
-    const tryParseCustom = (lines: string[]) => {
+    // Helper to attempt parsing a set of lines
+    const tryParseMRZ = (lines: string[]) => {
         try {
-            if (lines.length === 2 && lines[0].length === 44 && lines[1].length === 44) {
-                return parseTD3(lines)
-            }
-            if (lines.length === 3 && lines[0].length === 30 && lines[1].length === 30 && lines[2].length === 30) {
-                return parseTD1(lines)
-            }
+            return parse(lines)
         } catch (e) {
-            // ignore
+            return null
         }
-        return null
     }
     
-    // Generate candidates for 44 (Passport) and 30 (ID)
+    // Helper to generate sliding window candidates for a line
     const getCandidates = (line: string, targetLen: number): string[] => {
         const candidates: string[] = []
         if (line.length === targetLen) candidates.push(line)
@@ -595,7 +278,9 @@ const processMrz = async () => {
         return candidates
     }
 
-    // Try TD-3 (Last 2 lines, target 44)
+    // Strategy: Try last 2 lines (TD3), last 3 lines (TD1) with sliding window
+    
+    // Try TD-3 (Target 44 chars)
     if (!result && mrzLines.length >= 2) {
         const last2 = mrzLines.slice(-2)
         const l1Candidates = getCandidates(last2[0], 44)
@@ -603,19 +288,19 @@ const processMrz = async () => {
         
         for (const c1 of l1Candidates) {
             for (const c2 of l2Candidates) {
-                const res = tryParseCustom([c1, c2])
-                if (res && res.verification_status === 'VALID') {
-                    result = res // prioritize valid
+                const res = tryParseMRZ([c1, c2])
+                if (res && res.valid) {
+                    result = res
                     break
                 }
-                if (res) result = res // accept invalid if nothing better
+                if (res && !result) result = res
             }
-            if (result && result.verification_status === 'VALID') break
+            if (result?.valid) break
         }
     }
 
-    // Try TD-1 (Last 3 lines, target 30)
-    if ((!result || result.verification_status === 'INVALID') && mrzLines.length >= 3) {
+    // Try TD-1 (Target 30 chars)
+    if ((!result || !result.valid) && mrzLines.length >= 3) {
         const last3 = mrzLines.slice(-3)
         const l1C = getCandidates(last3[0], 30)
         const l2C = getCandidates(last3[1], 30)
@@ -624,48 +309,41 @@ const processMrz = async () => {
         for (const c1 of l1C) {
             for (const c2 of l2C) {
                 for (const c3 of l3C) {
-                   const res = tryParseCustom([c1, c2, c3])
-                   if (res && res.verification_status === 'VALID') {
+                   const res = tryParseMRZ([c1, c2, c3])
+                   if (res && res.valid) {
                        result = res
                        break
                    }
                    if (res && !result) result = res
                 }
-                if (result && result.verification_status === 'VALID') break
+                if (result?.valid) break
             }
-            if (result && result.verification_status === 'VALID') break
+            if (result?.valid) break
         }
+    }
+    
+    // Fallback: Just try what we have if selection failed or wasn't applicable
+    if (!result && mrzLines.length > 0) {
+        result = tryParseMRZ(mrzLines)
     }
 
     rawMrzText.value = mrzLines.join('\n')
     
-    // Mapping to legacy state for UI continuity, but ideally we show the new structure
-    // We'll update the 'parsedResult' to use the new Unified form and update the template separately?
-    // Or just map it back to the interface expected by the template for now, and expose the new JSON.
-    // The user wants "Желаемый формат вывода". I should store this in a new ref.
-
     if (result) {
-        // We'll cast to any for the UI template to keep it working, 
-        // OR update the template. Let's update the interface above later or mapped here.
-        // The current 'parsedResult' interface is loose enough to just populate new fields 
-        // if we change the type or add 'any'.
-        
         parsedResult.value = {
-            documentType: result.document_type === 'PASSPORT' ? 'Passport (TD-3)' : 'ID Card (TD-1)',
-            documentNumber: result.document_number,
-            firstName: result.names.given_names,
-            lastName: result.names.surname,
-            nationality: result.nationality,
-            birthDate: result.birth_date,
-            sex: result.sex,
-            expirationDate: result.expiry_date,
-            issuingCountry: result.nationality, // heuristic
-            valid: result.verification_status === 'VALID',
-            details: result.errors?.map(e => ({ label: 'Error', value: e })) || [],
-            personal_number: result.personal_number,
-            
-            // New fields for specific display requested
-            unifiedJson: result // Store the full object to display
+            documentType: result.format,
+            documentNumber: result.fields.documentNumber,
+            firstName: result.fields.firstName,
+            lastName: result.fields.lastName,
+            nationality: result.fields.nationality,
+            birthDate: result.fields.birthDate,
+            sex: result.fields.sex,
+            expirationDate: result.fields.expirationDate,
+            issuingCountry: result.fields.issuingState || result.fields.nationality,
+            personal_number: result.fields.personalNumber,
+            valid: result.valid,
+            details: result.details || [],
+            unifiedJson: result
         } as any
     } else {
          error.value = `MRZ detected but parsing failed. Could not fit to TD-3 (44) or TD-1 (30) standards.`
